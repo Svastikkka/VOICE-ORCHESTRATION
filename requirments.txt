@@ -1,0 +1,8 @@
+pipecat-ai
+FastAPI
+websockets
+uvicorn
+numpy 
+soundfile
+python-dotenv
+twilio
