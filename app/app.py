@@ -86,6 +86,8 @@ async def twilio_stream(ws: WebSocket):
     await ws.accept()
     print("Twilio WebSocket connected")
 
+    stream_sid = None
+
     try:
         while True:
             msg = await ws.receive_text()
@@ -93,43 +95,51 @@ async def twilio_stream(ws: WebSocket):
 
             event = data.get("event")
 
-            # ---------------------------
-            # CALL EVENTS
-            # ---------------------------
+            # ------------------------------------
+            # STREAM STARTED
+            # ------------------------------------
             if event == "start":
-                print("Call started")
+                stream_sid = data["start"]["streamSid"]
+                print(f"Stream started: {stream_sid}")
                 continue
 
+            # ------------------------------------
+            # STREAM STOPPED
+            # ------------------------------------
             if event == "stop":
                 print("Call stopped")
                 break
 
-            # ---------------------------
-            # MEDIA EVENT (audio)
-            # ---------------------------
+            # ------------------------------------
+            # MEDIA AUDIO
+            # ------------------------------------
             if event == "media":
                 media_payload = data["media"]["payload"]
 
-                # μ-law → PCM
+                # μ-law → PCM16
                 pcm_in = ulaw_b64_to_pcm16(media_payload)
 
-                # STT (fake)
+                # Fake STT
                 text = await fake_stt(pcm_in)
                 print("Caller said:", text)
 
-                # TTS (fake)
+                # Fake TTS
                 pcm_out = await fake_tts(text)
 
                 # PCM → μ-law
                 payload_out = pcm16_to_ulaw_b64(pcm_out)
 
-                # Send audio back
-                await ws.send_text(json.dumps({
+                # REQUIRED FORMAT
+                reply = {
                     "event": "media",
-                    "media": {"payload": payload_out}
-                }))
+                    "streamSid": stream_sid,
+                    "media": {
+                        "payload": payload_out
+                    }
+                }
 
-                print("Sent audio back to caller")
+                await ws.send_text(json.dumps(reply))
+                print("Sent audio back")
 
     except Exception as e:
         print("WebSocket error:", e)
