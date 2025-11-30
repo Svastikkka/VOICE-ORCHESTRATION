@@ -51,3 +51,14 @@ app1.py: Basic Integration with Fake TTS/STT/LLM
 app2.py: Integration with STT and Open AI LLM
 app3.py: Integration with TTS
 app4.py: Improve VAD to take complete input even if the user take pause
+
+
+# How To Run
+
+```bash
+uvicorn samples.app4:app --reload
+```
+
+```bash
+ngrok http --url=https://oss-test.ngrok.app  8000
+```
