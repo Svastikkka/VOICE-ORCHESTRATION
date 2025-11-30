@@ -143,10 +143,20 @@ class OpenAILLM:
                     {"role": "system", "content": "You are a concise phone assistant. Keep responses short."},
                     {"role": "user", "content": text},
                 ],
+                stream=True,
                 max_tokens=60,
             )
-            # new SDK: message is an object
-            return (response.choices[0].message.content or "").strip()
+            full_reply = []
+
+            async for chunk in response:
+                # Chunks arrive as StreamCompletionChunk objects
+                # We extract the content from the delta object in each chunk
+                content = chunk.choices[0].delta.content
+                if content:
+                    full_reply.append(content)
+            # Combine all chunks into the final string
+            return "".join(full_reply).strip()
+
         except Exception as e:
             print("OpenAI error:", e)
             return ""
