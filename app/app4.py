@@ -307,13 +307,13 @@ class VoicePipeline:
 
         # --- silence detection ---
         energy = audioop.rms(pcm16, 2)
-        if energy < 200:   # tweak this threshold
+        if energy < 350:   # tweak this threshold
             self.silence_frames += 1
         else:
             self.silence_frames = 0
 
         # 10 consecutive silent frames (~200ms) = user finished speaking
-        if self.silence_frames > 10 and len(self.buffer) > 0:
+        if self.silence_frames > 40 and len(self.buffer) > 0:
             chunk = self.buffer
             self.buffer = b""
             task = asyncio.create_task(self._process_and_play(chunk))
