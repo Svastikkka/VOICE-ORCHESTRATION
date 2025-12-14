@@ -63,5 +63,5 @@ uvicorn samples.app4:app --reload
 ```
 
 ```bash
-ngrok http --url=https://oss-test.ngrok.app  8000
+ngrok http --url=https://test.ngrok.app  8000
 ```
