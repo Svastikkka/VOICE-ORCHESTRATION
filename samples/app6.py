@@ -101,34 +101,47 @@ class TwilioTransport:
 # ------------------------
 class DeepgramSTT:
     async def run(self, pcm16: bytes) -> str:
-        # send PCM16 chunk to Deepgram REST /listen (synchronous transcription for chunk)
-        if not DG_KEY:
+        if not DG_KEY or len(pcm16) < 16000:  # ~1s audio minimum
             return ""
-        async with aiohttp.ClientSession() as session:
+
+        for attempt in (1, 2):
             try:
-                async with session.post(
-                    DEEPGRAM_URL,
-                    data=pcm16,
-                    headers={
-                        "Content-Type": "audio/pcm",
-                        "Authorization": f"Token {DG_KEY}",
-                    },
-                    params={"model": "nova-2", "encoding": "linear16", "sample_rate": 8000},
-                    timeout=10,
-                ) as resp:
-                    if resp.status != 200:
-                        txt = await resp.text()
-                        print("Deepgram HTTP Error", resp.status, txt)
-                        return ""
-                    out = await resp.json()
-                    # navigate safely
-                    try:
-                        return out["results"]["channels"][0]["alternatives"][0].get("transcript","") or ""
-                    except Exception:
-                        return ""
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        DEEPGRAM_URL,
+                        data=pcm16,
+                        headers={
+                            "Content-Type": "audio/pcm",
+                            "Authorization": f"Token {DG_KEY}",
+                        },
+                        params={
+                            "model": "nova-2",
+                            "encoding": "linear16",
+                            "sample_rate": 8000,
+                            "punctuate": "true",
+                            "endpointing": "true",
+                        },
+                        timeout=10,
+                    ) as resp:
+
+                        if resp.status != 200:
+                            if attempt == 2:
+                                print("Deepgram HTTP error:", resp.status)
+                            continue
+
+                        out = await resp.json()
+                        return (
+                            out["results"]["channels"][0]["alternatives"][0]
+                            .get("transcript", "")
+                            .strip()
+                        )
+
             except Exception as e:
-                print("Deepgram request failed:", e)
-                return ""
+                if attempt == 2:
+                    print("Deepgram failed twice:", e)
+                await asyncio.sleep(0.1)
+
+        return ""
 
 # ------------------------
 # REAL LLM (OpenAI GPT-4o-mini)
@@ -310,6 +323,11 @@ class VoicePipeline:
         self.playback_queue = asyncio.Queue()
         self.playback_worker_task = asyncio.create_task(self._playback_worker())
 
+        # --- Utterance segmentation ---
+        self.speech_frames = 0            # frames with speech
+        self.MIN_UTTERANCE_MS = 700        # minimum speech before STT
+        self.MAX_PAUSE_FRAMES = 60         # ~1.2s silence @ 20ms/frame
+
     async def _playback_worker(self):
         while True:
             pcm_ulaw = await self.playback_queue.get()
@@ -360,20 +378,37 @@ class VoicePipeline:
         # --- silence detection ---
         energy = audioop.rms(pcm16, 2)
 
-        # BARGE-IN DETECTION
+        # -------------------------
+        # BARGE-IN (unchanged)
+        # -------------------------
         if energy > self.SPEECH_BARGEIN_THRESHOLD and self.is_playing_tts:
             print("BARGE-IN detected — stopping TTS")
             await self._stop_tts_playback()
 
-        if energy < 350:
-            self.silence_frames += 1
-        else:
+        # -------------------------
+        # UTTERANCE TRACKING
+        # -------------------------
+        if energy > 350:
+            self.speech_frames += 1
             self.silence_frames = 0
+        else:
+            self.silence_frames += 1
 
-        # 10 consecutive silent frames (~200ms) = user finished speaking
-        if self.silence_frames > 40 and len(self.buffer) > 0:
+        utterance_ms = self.speech_frames * 20  # 20ms per frame
+
+        # -------------------------
+        # END-OF-UTTERANCE
+        # -------------------------
+        if (
+            self.silence_frames > self.MAX_PAUSE_FRAMES and
+            utterance_ms >= self.MIN_UTTERANCE_MS and
+            len(self.buffer) > 0
+        ):
             chunk = self.buffer
             self.buffer = b""
+            self.silence_frames = 0
+            self.speech_frames = 0
+
             task = asyncio.create_task(self._process_and_play(chunk))
             self.processing_tasks.add(task)
             task.add_done_callback(lambda t: self.processing_tasks.discard(t))
@@ -397,7 +432,8 @@ class VoicePipeline:
         try:
             text = await self.stt.run(chunk)
             print("STT:", text)
-            if not text.strip():
+            if not text or len(text.strip()) < 3:
+                print("Ignoring empty / weak STT")
                 return
 
             reply = await self.llm.run(text)
