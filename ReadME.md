@@ -53,6 +53,7 @@ Note: Each arrow is a Processor
 - app4.py: Improve VAD to take complete input even if the user take pause
 - app5.py: Add BARGE-IN DETECTION
 - app6.py: Add MIN_UTTERANCE_MS & MAX_PAUSE_FRAMES
+- app7.py: Enable STT Streaming
 
 
 # How To Run
