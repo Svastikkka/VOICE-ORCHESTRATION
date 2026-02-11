@@ -1,11 +1,10 @@
 import os
 import json
+import time
 import base64
 import audioop
 import aiohttp
 import asyncio
-import io
-import wave
 import websockets
 import urllib.parse
 import subprocess
@@ -76,6 +75,8 @@ class DeepgramStreamingSTT:
         self.connected = False
         self.keep_alive_task = None
         self.current_utterance = []
+        self.utterance_start_time = None
+        self.transcript_ready_time = None
 
     async def connect(self):
         params = {
@@ -98,16 +99,32 @@ class DeepgramStreamingSTT:
             data = json.loads(msg)
             if data.get("type") != "Results": continue
             transcript = data["channel"]["alternatives"][0].get("transcript", "").strip()
-            if not transcript: continue
-            
-            if data.get("is_final"): self.current_utterance.append(transcript)
+            if not transcript: 
+                continue
+
+            if data.get("is_final"):
+                self.current_utterance.append(transcript)
+
             if data.get("speech_final"):
+                self.transcript_ready_time = time.time()
                 full_text = " ".join(self.current_utterance).strip()
                 self.current_utterance.clear()
-                if full_text: await self.on_utterance_complete(full_text)
+
+                if full_text:
+                    # Compute STT metrics
+                    if self.utterance_start_time:
+                        ttft = self.transcript_ready_time - self.utterance_start_time
+                        ttfb = self.transcript_ready_time - self.utterance_start_time  # For Deepgram, TTFT ~ TTFB
+                        print(f"[STT] TTFB: {ttfb:.3f}s, TTFT: {ttft:.3f}s")
+                        self.utterance_start_time = None  # reset
+                    await self.on_utterance_complete(full_text)
 
     async def send_audio(self, pcm16: bytes):
-        if self.connected: await self.ws.send(pcm16)
+        if self.connected:
+            # mark first audio frame for metrics
+            if not self.utterance_start_time:
+                self.utterance_start_time = time.time()
+            await self.ws.send(pcm16)
 
     async def close(self):
         self.connected = False
@@ -124,17 +141,16 @@ class CustomLLM:
         prompt_file_path = os.path.join(current_dir, prompt_file_name)
         with open(prompt_file_path, "r") as f:
             self.system_prompt = f.read()
-        self.system_prompt_added = False  # track if system prompt is already used
+        self.system_prompt_added = False
 
     async def run(self, conversation_history: list) -> str:
         messages = []
-        # Add system prompt only once
         if not self.system_prompt_added:
             messages.append({"role": "system", "content": self.system_prompt})
             self.system_prompt_added = True
 
-        # Append recent conversation history
-        messages += conversation_history[-10:]  # last 10 messages
+        messages += conversation_history[-10:]
+        start_time = time.time()
         response = await self.client.chat.completions.create(
             model="voicing-llm-v1.5",
             messages=messages,
@@ -144,6 +160,8 @@ class CustomLLM:
         async for chunk in response:
             if chunk.choices[0].delta.content:
                 full_reply.append(chunk.choices[0].delta.content)
+        ttfb = time.time() - start_time
+        print(f"[LLM] TTFB: {ttfb:.3f}s")
         return "".join(full_reply).strip()
 
 # ------------------------
@@ -151,6 +169,7 @@ class CustomLLM:
 # ------------------------
 class ElevenLabsTTS:
     async def run(self, text: str) -> bytes:
+        start_time = time.time()
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 f"{ELEVEN_URL}/{EL_VOICE}",
@@ -162,7 +181,10 @@ class ElevenLabsTTS:
                     ["ffmpeg", "-i", "pipe:0", "-f", "s16le", "-ac", "1", "-ar", "8000", "pipe:1"],
                     input=raw, stdout=subprocess.PIPE, stderr=subprocess.PIPE
                 )
-                return audioop.lin2ulaw(ensure_even_bytes(ff.stdout), 2)
+                audio = audioop.lin2ulaw(ensure_even_bytes(ff.stdout), 2)
+        ttfb = time.time() - start_time
+        print(f"[TTS] TTFB: {ttfb:.3f}s")
+        return audio
 
 # ------------------------
 # Pipeline & Orchestration
@@ -177,34 +199,33 @@ class VoicePipeline:
         self.current_tts_task = None
         self.stt = DeepgramStreamingSTT(self._on_stt_utterance)
         self.history = []
-        self.first_interaction_done = False  # Track first interaction
+        self.first_interaction_done = False
         asyncio.create_task(self.stt.connect())
         asyncio.create_task(self._playback_worker())
 
     async def _on_stt_utterance(self, text):
-        print(f"User said: {text}")
-
-        # 1. Add user input to history
+        user_received_time = time.time()
+        print(f"[STT] User said: {text}")
         self.history.append({"role": "user", "content": text})
 
-        # 2. Only send greeting if first interaction
+        # Non-blocking greeting for first interaction
         if not self.first_interaction_done:
-            greeting = "Hello, this is Alex from IT Support. How can I help you today?"
             self.first_interaction_done = True
+            greeting = "Hello, this is Alex from IT Support. How can I help you today?"
             self.history.append({"role": "assistant", "content": greeting})
-            audio = await self.tts.run(greeting)
-            await self.playback_queue.put(audio)
-            return  # Wait for next user input before generating LLM reply
+            asyncio.create_task(self.playback_queue.put(await self.tts.run(greeting)))
 
-        # 3. Generate LLM reply based on conversation history
+        # LLM processing
         reply = await self.llm.run(self.history)
-        print(f"Bot replied: {reply}")
-
-        # 4. Add bot reply to history
         self.history.append({"role": "assistant", "content": reply})
 
-        # 5. Convert to TTS
+        # TTS processing
         audio = await self.tts.run(reply)
+
+        # TTFT metric
+        ttft = time.time() - user_received_time
+        print(f"[Voice Pipeline] TTFT: {ttft:.3f}s")
+
         await self.playback_queue.put(audio)
 
     async def _playback_worker(self):
@@ -234,11 +255,11 @@ class VoicePipeline:
             await self.transport.clear_buffer()
             while not self.playback_queue.empty():
                 self.playback_queue.get_nowait()
+                self.playback_queue.task_done()
 
 # ------------------------
 # Routes
 # ------------------------
-
 @app.post("/incoming_call")
 async def incoming_call(request: Request):
     base_url = os.getenv("PUBLIC_WEBSOCKET_URL", "").rstrip("/")
@@ -265,10 +286,6 @@ async def twilio_stream(ws: WebSocket):
             msg = json.loads(data)
             if msg["event"] == "start":
                 transport.stream_sid = msg["start"]["streamSid"]
-                # Initial greeting
-                greeting = "Hello, this is Alex from IT Support, How can I help you today?"
-                audio = await pipeline.tts.run(greeting)
-                await pipeline.playback_queue.put(audio)
             elif msg["event"] == "media":
                 pcm_in = ulaw_b64_to_pcm16(msg["media"]["payload"])
                 await pipeline.accept_audio(pcm_in)
