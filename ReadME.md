@@ -54,7 +54,11 @@ Note: Each arrow is a Processor
 - app5.py: Add BARGE-IN DETECTION
 - app6.py: Add MIN_UTTERANCE_MS & MAX_PAUSE_FRAMES
 - app7.py: Enable STT Streaming
-
+- app8.py: Fixed hard coded url issues
+- app9.py: Integration with LLM             // We start using custom LLM Qwen 30B Model
+- app10.py: Improving VAD & BargeIN
+- app11.py: Enable CustomLLM Streaming with simple Logger
+- app12.py: Add Tool Call support
 
 # How To Run
 
