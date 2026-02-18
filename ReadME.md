@@ -59,6 +59,9 @@ Note: Each arrow is a Processor
 - app10.py: Improving VAD & BargeIN
 - app11.py: Enable CustomLLM Streaming with simple Logger
 - app12.py: Add Tool Call support
+- app13.py: Example setup with CustomLLM + ElevenLabs + Google STT (regional)
+- app14.py: Example setup with CustomLLM + ElevenLabs + Google STT (global)
+
 
 # How To Run
 
