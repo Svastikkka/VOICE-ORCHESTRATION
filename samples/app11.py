@@ -28,6 +28,8 @@ DG_KEY = os.getenv("DEEPGRAM_API_KEY")
 EL_KEY = os.getenv("ELEVENLABS_API_KEY")
 EL_VOICE = os.getenv("ELEVENLABS_VOICE_ID")
 ELEVEN_URL = "https://api.elevenlabs.io/v1/text-to-speech"
+LLM_URL = os.getenv("LLM_BASE_URL")
+LLM_MODEL = os.getenv("LLM_MODEL")
 
 # Helpers
 def ulaw_b64_to_pcm16(b64_data: str) -> bytes:
@@ -141,7 +143,7 @@ class DeepgramStreamingSTT:
 # ------------------------
 class CustomLLM:
     def __init__(self, prompt_file_name="prompt.txt"):
-        self.client = AsyncOpenAI(api_key="any", base_url="https://llm-dev.nonprod.voicing.ai/v1")
+        self.client = AsyncOpenAI(api_key="any", base_url=f"{LLM_URL}")
         current_dir = os.path.dirname(os.path.abspath(__file__))
         prompt_file_path = os.path.join(current_dir, prompt_file_name)
         with open(prompt_file_path, "r") as f:
@@ -158,7 +160,7 @@ class CustomLLM:
 
         start_time = time.time()
         response = await self.client.chat.completions.create(
-            model="voicing-llm-v1.5",
+            model=f"{LLM_MODEL}",
             messages=messages,
             stream=True
         )

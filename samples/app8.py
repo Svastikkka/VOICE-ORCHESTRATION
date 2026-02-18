@@ -555,7 +555,6 @@ router = APIRouter()
 
 @app.post("/incoming_call")
 async def incoming_call(request: Request):
-    # Get the base URL: "wss://anywhere-testing.demo.oss.voicing.ai"
     base_url = os.getenv("PUBLIC_WEBSOCKET_URL", "").rstrip("/")
     
     # Manually append the path your WebSocket is listening on
@@ -563,7 +562,6 @@ async def incoming_call(request: Request):
 
     resp = VoiceResponse()
     connect = Connect()
-    # This now sends: wss://anywhere-testing.demo.oss.voicing.ai/twilio-stream
     connect.append(Stream(url=stream_url))
     resp.append(connect)
     return Response(content=str(resp), media_type="application/xml")

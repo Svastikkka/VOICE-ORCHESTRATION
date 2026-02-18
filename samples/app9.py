@@ -23,12 +23,12 @@ MULAW_SILENCE = b'\xff'
 
 DEEPGRAM_URL = "https://api.deepgram.com/v1/listen"
 DG_KEY = os.getenv("DEEPGRAM_API_KEY")
-
 ELEVEN_URL = "https://api.elevenlabs.io/v1/text-to-speech"
 EL_KEY = os.getenv("ELEVENLABS_API_KEY")
 EL_VOICE = os.getenv("ELEVENLABS_VOICE_ID")
-
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+LLM_URL = os.getenv("LLM_BASE_URL")
+LLM_MODEL = os.getenv("LLM_MODEL")
 
 client = AsyncOpenAI(api_key=OPENAI_KEY)
 
@@ -245,7 +245,7 @@ class CustomLLM:
     def __init__(self, prompt_file_path="prompt.txt"):
         self.client = AsyncOpenAI(
             api_key="any-string", 
-            base_url="https://llm.dev.voicing.ai/v1"
+            base_url=f"{LLM_URL}"
         )
         self.system_prompt = self._load_prompt(prompt_file_path)
 
@@ -269,7 +269,7 @@ class CustomLLM:
         try:
             # Note: Using chat.completions for better guardrail adherence
             response = await self.client.chat.completions.create(
-                model="voicing-llm-v1.5",
+                model=f"{LLM_MODEL}",
                 messages=messages,
                 stream=True,
                 max_tokens=250, # Increased for your "long story" or detailed tasks
@@ -464,7 +464,6 @@ router = APIRouter()
 
 @app.post("/incoming_call")
 async def incoming_call(request: Request):
-    # Get the base URL: "wss://anywhere-testing.demo.oss.voicing.ai"
     base_url = os.getenv("PUBLIC_WEBSOCKET_URL", "").rstrip("/")
     
     # Manually append the path your WebSocket is listening on
@@ -472,7 +471,6 @@ async def incoming_call(request: Request):
 
     resp = VoiceResponse()
     connect = Connect()
-    # This now sends: wss://anywhere-testing.demo.oss.voicing.ai/twilio-stream
     connect.append(Stream(url=stream_url))
     resp.append(connect)
     return Response(content=str(resp), media_type="application/xml")

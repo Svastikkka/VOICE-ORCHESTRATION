@@ -14,6 +14,11 @@ from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
+#   Google STT imports
+from google.cloud.speech_v2 import SpeechAsyncClient
+from google.cloud.speech_v2.types import cloud_speech
+from google.api_core.client_options import ClientOptions
+
 load_dotenv()
 app = FastAPI()
 router = APIRouter()
@@ -30,6 +35,7 @@ EL_VOICE = os.getenv("ELEVENLABS_VOICE_ID")
 ELEVEN_URL = "https://api.elevenlabs.io/v1/text-to-speech"
 LLM_URL = os.getenv("LLM_BASE_URL")
 LLM_MODEL = os.getenv("LLM_MODEL")
+PROJECT_ID = os.getenv("PROJECT_ID") # For GCP only
 
 # Helpers
 def ulaw_b64_to_pcm16(b64_data: str) -> bytes:
@@ -70,87 +76,111 @@ class TwilioTransport:
 # ------------------------
 # Deepgram Streaming STT
 # ------------------------
-class DeepgramStreamingSTT:
+class GoogleStreamingSTT:
     def __init__(self, on_utterance_complete):
         self.on_utterance_complete = on_utterance_complete
-        self.ws = None
+        self.client = SpeechAsyncClient(
+            client_options=ClientOptions(api_endpoint="speech.googleapis.com")
+        )
+        self.audio_queue = asyncio.Queue()
         self.connected = False
-        self.keep_alive_task = None
-        self.current_utterance = []
-        self.utterance_start_time = None
-        self.transcript_ready_time = None
-        self.speech_start_time = None
-        self.first_transcript_time = None
+        self._main_task = None
+        self.buffer = bytearray()
+        self.buffer_threshold = 1600
+        self.stream_start_time = None
+        self.first_interim_time = None
+        self.first_final_time = None
+        # Using "_" for the default/inline recognizer is most reliable
+        self.recognizer = f"projects/{PROJECT_ID}/locations/global/recognizers/telephony-recognizer-global"
 
     async def connect(self):
-        params = {
-            "model": "nova-2", "encoding": "linear16", "sample_rate": 8000, "vad_events": "true",
-            "punctuate": "true", "endpointing": "300", "interim_results": "true",
-        }
-        url = "wss://api.deepgram.com/v1/listen?" + urllib.parse.urlencode(params)
-        self.ws = await websockets.connect(url, extra_headers={"Authorization": f"Token {DG_KEY}"})
+        if self.connected: return
         self.connected = True
-        self.keep_alive_task = asyncio.create_task(self._keep_alive())
-        asyncio.create_task(self._recv_loop())
+        self._main_task = asyncio.create_task(self._infinite_loop())
+        print("[Google STT] Connection task started.")
 
-    async def _keep_alive(self):
+    async def _infinite_loop(self):
         while self.connected:
-            await asyncio.sleep(5)
-            if self.ws: await self.ws.send(json.dumps({"type": "KeepAlive"}))
+            try:
+                await self._run_single_stream_v2()
+            except Exception as e:
+                print(f"[Google STT] Stream error: {e}. Restarting in 1s...")
+                await asyncio.sleep(1)
 
-    async def _recv_loop(self):
-        async for msg in self.ws:
-            data = json.loads(msg)
+    async def _run_single_stream_v2(self):
+        self.stream_start_time = time.time()
+        self.first_interim_time = None
+        self.first_final_time = None
+        recognition_config = cloud_speech.RecognitionConfig(
+            explicit_decoding_config=cloud_speech.ExplicitDecodingConfig(
+                encoding=cloud_speech.ExplicitDecodingConfig.AudioEncoding.MULAW,
+                sample_rate_hertz=8000,
+                audio_channel_count=1,
+            ),
+            language_codes=["en-US"],
+            model="telephony", 
+            features=cloud_speech.RecognitionFeatures(
+                profanity_filter=True,
+                enable_automatic_punctuation=True
+            ),
+        )
 
-            # Speech start detected by Deepgram VAD
-            if data.get("type") == "SpeechStarted":
-                self.speech_start_time = time.time()
-                self.first_transcript_time = None
-                continue
+        streaming_config = cloud_speech.StreamingRecognitionConfig(
+            config=recognition_config,
+            streaming_features=cloud_speech.StreamingRecognitionFeatures(interim_results=True)
+        )
 
-            if data.get("type") != "Results":
-                continue
+        async def request_generator():
+            # 1. First yield MUST be the config
+            yield cloud_speech.StreamingRecognizeRequest(
+                recognizer=self.recognizer,
+                streaming_config=streaming_config
+            )
+            
+            while self.connected:
+                chunk = await self.audio_queue.get()
+                if chunk is None: break
+                # 2. FIX: Field name is 'audio', not 'audio_content'
+                yield cloud_speech.StreamingRecognizeRequest(audio=chunk)
 
-            transcript = data["channel"]["alternatives"][0].get("transcript", "").strip()
-            if not transcript:
-                continue
+        # 3. Process responses
+        responses = await self.client.streaming_recognize(requests=request_generator())
 
-            now = time.time()
+        async for response in responses:
+            if not self.connected: break
+            if not response.results: continue
 
-            # 🟢 STT TTFT (first words recognized)
-            if self.first_transcript_time is None and self.speech_start_time:
-                self.first_transcript_time = now
-                print(f"[STT] TTFT (first transcript): {now - self.speech_start_time:.3f}s")
+            result = response.results[0]
+            if not result.alternatives: continue
 
-            # Collect finals for full utterance
-            if data.get("is_final"):
-                self.current_utterance.append(transcript)
+            transcript = result.alternatives[0].transcript
+            if not result.is_final:
+                if self.first_interim_time is None:
+                    self.first_interim_time = time.time()
+                    print(f"[STT] TTFT (audio → first interim): "
+                        f"{self.first_interim_time - self.stream_start_time:.3f}s")
+                print(f"STT (Interim): {transcript}")
+            else:
+                if self.first_final_time is None:
+                    self.first_final_time = time.time()
+                    print(f"[STT] TTFB (audio → first final): "
+                        f"{self.first_final_time - self.stream_start_time:.3f}s")
+                print(f"STT (Final): {transcript}")
+                await self.on_utterance_complete(transcript)
 
-            # 🔵 STT Finalization Latency (user stopped speaking)
-            if data.get("speech_final") and self.speech_start_time:
-                final_time = now
-                print(f"[STT] Finalization latency (speech_final): {final_time - self.speech_start_time:.3f}s")
-
-                full_text = " ".join(self.current_utterance).strip()
-                self.current_utterance.clear()
-                self.speech_start_time = None
-                self.first_transcript_time = None
-
-                if full_text:
-                    await self.on_utterance_complete(full_text)
-
-    async def send_audio(self, pcm16: bytes):
+    async def send_audio(self, mulaw: bytes):
         if self.connected:
-            # mark first audio frame for metrics
-            if not self.utterance_start_time:
-                self.utterance_start_time = time.time()
-            await self.ws.send(pcm16)
+            self.buffer.extend(mulaw)
+            if len(self.buffer) >= self.buffer_threshold:
+                await self.audio_queue.put(bytes(self.buffer))
+                self.buffer.clear()
 
     async def close(self):
         self.connected = False
-        if self.keep_alive_task: self.keep_alive_task.cancel()
-        if self.ws: await self.ws.close()
-
+        await self.audio_queue.put(None)
+        if self._main_task:
+            self._main_task.cancel()
+        print("[Google STT] Connection closed.")
 # ------------------------
 # Custom LLM (Streaming)
 # ------------------------
@@ -427,6 +457,8 @@ class ElevenLabsTTS:
 
     async def run_streaming(self, text_iterator, on_audio_chunk):
         async with websockets.connect(self.uri) as ws:
+            tts_start_time = None
+            first_audio_received_time = None
             await ws.send(json.dumps({
                 "text": " ", 
                 "voice_settings": {"stability": 0.5, "similarity_boost": 0.8},
@@ -434,11 +466,16 @@ class ElevenLabsTTS:
             }))
 
             async def listen_for_audio():
+                nonlocal first_audio_received_time
                 while True:
                     try:
                         response = await ws.recv()
                         data = json.loads(response)
                         if data.get("audio"):
+                            if first_audio_received_time is None and tts_start_time:
+                                first_audio_received_time = time.time()
+                                print(f"[TTS] TTFT (text → first audio chunk): "
+                                    f"{first_audio_received_time - tts_start_time:.3f}s")
                             # This is now raw ulaw audio, ready for Twilio!
                             audio_data = base64.b64decode(data["audio"])
                             await on_audio_chunk(audio_data)
@@ -451,6 +488,8 @@ class ElevenLabsTTS:
 
             async for text in text_iterator:
                 if text:
+                    if tts_start_time is None:
+                        tts_start_time = time.time()
                     await ws.send(json.dumps({"text": text, "try_trigger_generation": True}))
 
             await ws.send(json.dumps({"text": ""}))
@@ -467,11 +506,16 @@ class VoicePipeline:
         self.playback_queue = asyncio.Queue()
         self.is_playing_tts = False
         self.current_tts_task = None
-        self.stt = DeepgramStreamingSTT(self._on_stt_utterance)
+        self.stt = GoogleStreamingSTT(self._on_stt_utterance)
         self.history = []
         self.first_interaction_done = False
-        asyncio.create_task(self.stt.connect())
+        self.turn_start_time = None
+        self.first_audio_played = False
         asyncio.create_task(self._playback_worker())
+
+    async def start_greeting_with_delay(self):
+        await asyncio.sleep(1.0)  # wait 1 second before speaking
+        await self.start_greeting()
 
     async def start_greeting(self):
         """Triggers the bot to speak first."""
@@ -490,6 +534,9 @@ class VoicePipeline:
 
     # Inside VoicePipeline
     async def _on_stt_utterance(self, text):
+        # 🔥 Mark turn start (user finished speaking)
+        self.turn_start_time = time.time()
+        self.first_audio_played = False
         # If the bot was greeting and user interrupted, clear it
         if self.is_playing_tts:
              await self.interrupt()
@@ -519,6 +566,7 @@ class VoicePipeline:
         tts_task = asyncio.create_task(
             self.tts.run_streaming(text_gen(), self.playback_queue.put)
         )
+        self.current_tts_task = tts_task
 
         token_buffer = ""
         async def on_token(token):
@@ -540,12 +588,13 @@ class VoicePipeline:
 
     async def _playback_worker(self):
         while True:
-            audio = await self.playback_queue.get()
-            self.current_tts_task = asyncio.create_task(self._play_audio(audio))
             try:
-                await self.current_tts_task
+                audio = await self.playback_queue.get()
+                await self._play_audio(audio)
             except asyncio.CancelledError:
                 pass
+            except Exception as e:
+                print("Playback worker error:", e)
             finally:
                 self.is_playing_tts = False
                 self.current_tts_task = None
@@ -554,12 +603,27 @@ class VoicePipeline:
     async def _play_audio(self, audio):
         self.is_playing_tts = True
         for frame in split_frames(audio, 160):
-            await self.transport.send_media_payload(base64.b64encode(frame).decode())
+
+            if not self.first_audio_played:
+                self.first_audio_played = True
+                now = time.time()
+
+                if self.turn_start_time:
+                    latency = now - self.turn_start_time
+
+                    print(f"[TTS] TTFB (text → first playback frame): {latency:.3f}s")
+                    print(f"[E2E] User speech_final → first audio playback: {latency:.3f}s")
+
+            await self.transport.send_media_payload(
+                base64.b64encode(frame).decode()
+            )
             await asyncio.sleep(0.019)
 
-    async def accept_audio(self, pcm16):
-        await self.stt.send_audio(pcm16)
-        if self.is_playing_tts and audioop.rms(pcm16, 2) > 600:
+    async def accept_audio(self, mulaw_bytes):
+        # Google STT V2 expects raw mulaw for ExplicitDecodingConfig.MULAW
+        await self.stt.send_audio(mulaw_bytes)
+        pcm = audioop.ulaw2lin(mulaw_bytes, 2)
+        if self.is_playing_tts and audioop.rms(pcm, 2) > 2500:
             if self.current_tts_task:
                 self.current_tts_task.cancel()
             await self.transport.clear_buffer()
@@ -596,10 +660,18 @@ async def twilio_stream(ws: WebSocket):
             msg = json.loads(data)
             if msg["event"] == "start":
                 transport.stream_sid = msg["start"]["streamSid"]
-                asyncio.create_task(pipeline.start_greeting())
+                await pipeline.stt.connect()                  # start STT here only
+                asyncio.create_task(pipeline.start_greeting_with_delay())  
+
+
+                # Start STT immediately
+                await pipeline.stt.connect()
+
+                # Delay greeting slightly to avoid stepping on user audio
+                asyncio.create_task(pipeline.start_greeting_with_delay())
             elif msg["event"] == "media":
-                pcm_in = ulaw_b64_to_pcm16(msg["media"]["payload"])
-                await pipeline.accept_audio(pcm_in)
+                mulaw = base64.b64decode(msg["media"]["payload"])
+                await pipeline.accept_audio(mulaw)
             elif msg["event"] == "stop":
                 await pipeline.stt.close()
                 break
