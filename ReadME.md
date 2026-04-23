@@ -1,4 +1,4 @@
-# VOSS
+# VOS
 
 ### Everything is a Frame
 - Audio pieces
