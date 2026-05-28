@@ -1,5 +1,7 @@
 # VOS
 
+We created this proto type to understand how voice orchestrations works.
+
 ### Everything is a Frame
 - Audio pieces
 - LLM tokens
@@ -10,6 +12,8 @@
 - OpenAI
 - Deepgram
 - ElevenLabs
+- Google STT
+- CustomLLM (vLLM)
 
 ### Flow
 ```
@@ -45,6 +49,17 @@ User hears response
 ```
 Note: Each arrow is a Processor
 
+
+### How To Run
+
+```bash
+uvicorn src.app:app --reload
+```
+
+```bash
+ngrok http --url=https://test.ngrok.app  8000
+```
+
 ### Revision
 
 - app1.py: Basic Integration with Fake TTS/STT/LLM
@@ -63,7 +78,7 @@ Note: Each arrow is a Processor
 - app14.py: Example setup with CustomLLM + ElevenLabs + Google STT (global)
 
 
-# How To Run
+# How To Run Sample Revisions
 
 ```bash
 uvicorn samples.app4:app --reload
